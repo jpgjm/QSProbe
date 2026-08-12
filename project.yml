@@ -1,0 +1,74 @@
+name: QSProbe
+
+packages:
+  SwiftProtobuf:
+    url: https://github.com/apple/swift-protobuf.git
+    from: "1.28.2"
+
+options:
+  bundleIdPrefix: com.anony
+  deploymentTarget:
+    iOS: "16.6"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    ENABLE_BITCODE: "NO"
+
+targets:
+  QSProbe:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.6"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: SwiftProtobuf
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: QSProbe
+        CFBundleShortVersionString: "1.5.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+        # --- M0 の検証対象はこの 2 つ ---------------------------------
+        # multicast entitlement を使わずに Bonjour が動くかを確認する。
+        NSLocalNetworkUsageDescription: >-
+          同じ Wi-Fi 上の Quick Share 端末を検出し、ファイルを送受信するために
+          ローカルネットワークへのアクセスが必要です。
+        # 末尾ドット無しの 1 件だけ。コード側 (QuickShareMdns.serviceType) も
+        # ドット無しに揃えてあり、この組み合わせは実機で確認済み。
+        # Apple のドキュメント例もドット無し。
+        NSBonjourServices:
+          - _FC9F5ED42C8A._tcp
+        # -------------------------------------------------------------
+        # Live Photo のペア動画を取り出すには PHAssetResource 経由が必要で、
+        # そこで写真ライブラリ権限を要求する。
+        NSPhotoLibraryUsageDescription: >-
+          送信する写真や動画を取り出すために使用します。Live Photo を静止画と
+          ペア動画の両方として送るために必要です。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.qsprobe
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        # entitlements ファイルは意図的に持たない (SideStore が再署名する)

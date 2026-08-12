@@ -1,0 +1,122 @@
+name: Build QSProbe (unsigned IPA)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache SPM
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('project.yml') }}
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Show generated Info.plist
+        run: |
+          echo "----- Resources/Info.plist -----"
+          plutil -p Resources/Info.plist || cat Resources/Info.plist
+
+      - name: Build (unsigned)
+        id: build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project QSProbe.xcodeproj \
+            -scheme QSProbe \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath SourcePackages \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Package IPA
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/QSProbe.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::App bundle not found at $APP_PATH"
+            exit 1
+          fi
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry QSProbe-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh QSProbe-unsigned.ipa
+
+      - name: Verify Info.plist inside the app
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/QSProbe.app"
+          echo "----- keys that M0 depends on -----"
+          /usr/libexec/PlistBuddy -c "Print :NSLocalNetworkUsageDescription" "$APP_PATH/Info.plist" \
+            || echo "::error::NSLocalNetworkUsageDescription が埋め込まれていません"
+          /usr/libexec/PlistBuddy -c "Print :NSBonjourServices" "$APP_PATH/Info.plist" \
+            || echo "::error::NSBonjourServices が埋め込まれていません"
+          echo "----- Info.plist 全体 -----"
+          plutil -p "$APP_PATH/Info.plist"
+          echo "----- entitlements (空であるべき) -----"
+          codesign -d --entitlements :- "$APP_PATH" 2>&1 || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSProbe-unsigned-ipa
+          path: QSProbe-unsigned.ipa
+          if-no-files-found: error
+
+      # --- 失敗時の調査用アーティファクト ---------------------------------
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          mkdir -p build-failure
+          cp xcodebuild.log build-failure/ 2>/dev/null || true
+          grep -E "error:|error :" xcodebuild.log > build-failure/errors.txt 2>/dev/null || true
+          grep -E "warning:" xcodebuild.log > build-failure/warnings.txt 2>/dev/null || true
+          {
+            sw_vers
+            echo "---"
+            xcodebuild -version
+            echo "---"
+            xcodegen --version || true
+          } > build-failure/environment.txt
+          cp project.yml build-failure/ 2>/dev/null || true
+          mkdir -p build-failure/Sources
+          cp Sources/*.swift build-failure/Sources/ 2>/dev/null || true
+
+      - name: Step summary on failure
+        if: failure()
+        run: |
+          echo "## ビルド失敗" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -n 60 build-failure/errors.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "(errors.txt なし)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure
+          path: build-failure
