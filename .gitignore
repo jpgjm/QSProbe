@@ -1,0 +1,11 @@
+# xcodegen が生成するもの
+*.xcodeproj/
+build/
+DerivedData/
+Payload/
+*.ipa
+xcodebuild.log
+build-failure/
+
+.DS_Store
+SourcePackages/

@@ -1,0 +1,78 @@
+name: QSProbe
+
+packages:
+  SwiftProtobuf:
+    url: https://github.com/apple/swift-protobuf.git
+    from: "1.28.2"
+
+options:
+  bundleIdPrefix: com.anony
+  deploymentTarget:
+    iOS: "16.6"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    ENABLE_BITCODE: "NO"
+
+targets:
+  QSProbe:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.6"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: SwiftProtobuf
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: QSProbe
+        CFBundleShortVersionString: "0.7.3"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+        # --- M0 の検証対象はこの 2 つ ---------------------------------
+        # multicast entitlement を使わずに Bonjour が動くかを確認する。
+        NSLocalNetworkUsageDescription: >-
+          同じ Wi-Fi 上の Quick Share 端末を検出し、ファイルを送受信するために
+          ローカルネットワークへのアクセスが必要です。
+        # 【訂正】当初「末尾ドットの有無で照合が変わる」と推測したが誤りだった。
+        # 実測では **どちらの形式でも publish できる**。初版が失敗したのは
+        # LiveContainer 上で起動しており、ホスト側の NSBonjourServices 許可リストに
+        # `_FC9F5ED42C8A._tcp` が無かったため。サービスタイプ表記は無関係。
+        # (README「LiveContainer では動きません」と docs/LiveContainer-patch.md を参照)
+        # 両形式を残してあるのは無害な保険であり、必須ではない。
+        NSBonjourServices:
+          - _FC9F5ED42C8A._tcp
+          - _FC9F5ED42C8A._tcp.
+        # -------------------------------------------------------------
+        # Live Photo のペア動画を取り出すには PHAssetResource 経由が必要で、
+        # そこで写真ライブラリ権限を要求する。
+        NSPhotoLibraryUsageDescription: >-
+          送信する写真や動画を取り出すために使用します。Live Photo を静止画と
+          ペア動画の両方として送るために必要です。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.qsprobe
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        # entitlements ファイルは意図的に持たない (SideStore が再署名する)
