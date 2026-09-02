@@ -1,0 +1,16 @@
+# xcodegen が生成するもの
+*.xcodeproj/
+build/
+DerivedData/
+Payload/
+*.ipa
+xcodebuild.log
+build-failure/
+
+.DS_Store
+SourcePackages/
+
+# アカウント連携の資格情報。リポジトリには入れない。
+# GitHub の push protection が Google の OAuth 資格情報として検出する。
+AccountSettings.txt
+*.secrets.txt
