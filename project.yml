@@ -1,0 +1,219 @@
+name: QSProbe
+
+# ------------------------------------------------------------------
+# バージョン
+#
+# App Extension の CFBundleShortVersionString / CFBundleVersion は
+# ホストアプリと一致していないといけない。食い違うと iOS が拡張の起動を
+# 拒むことがある (インストール自体は通ってしまうので気付きにくい)。
+# 片方だけ更新する事故を防ぐため、アンカーで 1 か所にまとめる。
+# ------------------------------------------------------------------
+versionDefaults: &versionDefaults
+  CFBundleShortVersionString: "1.16.0"
+  CFBundleVersion: "1"
+
+packages:
+  SwiftProtobuf:
+    url: https://github.com/apple/swift-protobuf.git
+    from: "1.28.2"
+
+options:
+  bundleIdPrefix: com.anony
+  deploymentTarget:
+    iOS: "16.6"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    ENABLE_BITCODE: "NO"
+
+targets:
+  QSProbe:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.6"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: SwiftProtobuf
+      - target: QSProbeShare
+    # --- App Group -----------------------------------------------------
+    # Share Extension とホストアプリのファイル受け渡しに使う共有コンテナ。
+    #
+    # 実機ではここに書いた ID そのままではなく、署名ツールがチーム ID を
+    # 足した group.com.anony.qsprobe.<TeamID> が作られる。bundle ID が
+    # 書き換わるのと同じ事情なので、コードでは直書きせず
+    # SharedAppGroup が実行時に解決する。
+    #
+    # 拡張側にも同じ文字列を書くこと。署名ツールが自動で足す既定グループ
+    # (group.<bundleId>.<TeamID>) は拡張とホストで別 ID になるため使えない。
+    #
+    # なお CI は CODE_SIGNING_ALLOWED=NO なので、この entitlement は
+    # ビルド時にはバイナリへ入らない。ワークフロー側の
+    # 「Embed entitlements (ad-hoc sign)」ステップが埋め込み、それを
+    # 署名ツールが読んで App ID に capability を付ける。
+    # 署名しないと要求が読まれず、App Group は下りない (実測で確認済み)。
+    entitlements:
+      path: Resources/QSProbe.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.anony.qsprobe
+    # -------------------------------------------------------------------
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: QSProbe
+        <<: *versionDefaults
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+        # --- バックグラウンド継続 (iOS 26 の BGContinuedProcessingTask) -----
+        # 送受信の途中でホームに戻られても転送を続けるために使う。
+        # entitlements は不要で、この 2 キーだけで足りる。
+        #
+        # audio は「待ち受けの常駐」用 (Sources/BackgroundKeepAlive.swift)。
+        # BGContinuedProcessingTask は「前面の操作で始まり、進捗が測れて、
+        # 終わりが定義できる作業」向けなので、終わりの無い待ち受けには使えない
+        # (進捗を報告しないタスクは時間切れにされる — WWDC25 227)。
+        # 無音をループ再生してプロセスを眠らせないことで、NWListener と
+        # Bonjour publish を背面でも保つ。こちらも entitlement は不要。
+        UIBackgroundModes:
+          - processing
+          - audio
+        #
+        # 識別子は完全一致で書き並べる。ワイルドカード (com.anony.qsprobe.*)
+        # は実機で register() が false を返したため使えない。
+        #
+        # 起動しなかった原因は「識別子がアプリの bundle ID 配下に無いこと」
+        # だった。実機 13 回の試行で、同じ識別子の再利用でも
+        # setTaskCompleted(success: false) で閉じた識別子の再利用でも
+        # 問題なく起動することを確認したので、枠のローテーションは廃止した。
+        #
+        #   系列 1: SideStore が署名時に付けるチーム ID 込みの bundle ID 配下。
+        #           実機で実際に使われるのはこちら。
+        #           ※ 証明書を作り直してチーム ID が変われば、ここも直す。
+        #   系列 2: project.yml の素の bundle ID 配下。bundle ID が書き換え
+        #           られない配布 (Xcode から直接など) 用の控え。
+        #
+        # コード側 (BackgroundTransferTask.register) が実行時に register() を
+        # 試して、通ったほうを採用する。
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.anony.qsprobe.48A5LFNW96.transfer
+          - com.anony.qsprobe.transfer
+        # -------------------------------------------------------------
+        # --- M0 の検証対象はこの 2 つ ---------------------------------
+        # multicast entitlement を使わずに Bonjour が動くかを確認する。
+        NSLocalNetworkUsageDescription: >-
+          同じ Wi-Fi 上の Quick Share 端末を検出し、ファイルを送受信するために
+          ローカルネットワークへのアクセスが必要です。
+        # 末尾ドット無しの 1 件だけ。コード側 (QuickShareMdns.serviceType) も
+        # ドット無しに揃えてあり、この組み合わせは実機で確認済み。
+        # Apple のドキュメント例もドット無し。
+        NSBonjourServices:
+          - _FC9F5ED42C8A._tcp
+        # -------------------------------------------------------------
+        # Live Photo のペア動画を取り出すには PHAssetResource 経由が必要で、
+        # そこで写真ライブラリ権限を要求する。
+        # 受信した写真・動画を「写真」App に入れるために使う。追加のみ。
+        NSPhotoLibraryAddUsageDescription: >-
+          受け取った写真や動画を「写真」App に保存するために使用します。
+          ライブラリの中身を読むことはありません。
+        # Share Extension がホストを起こすためのスキーム。
+        # QSProbeURLScheme.scheme と一致させること。
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.anony.qsprobe.share
+            CFBundleURLSchemes:
+              - qsprobe
+        NSPhotoLibraryUsageDescription: >-
+          送信する写真や動画を取り出すために使用します。Live Photo を静止画と
+          ペア動画の両方として送るために必要です。
+        # OAuth のリダイレクトはループバック方式のみを使う。
+        #
+        # カスタムスキーム方式は、この client_id では Google が受け付けない
+        # (`Custom scheme URI not allowed`)。加えて、逆順クライアント ID を
+        # ここに書くと client_id をリポジトリに埋めることになるので、
+        # CFBundleURLTypes は登録しない。
+        #
+        # `ASWebAuthenticationSession` は Info.plist の登録が無くても
+        # コールバックを拾えるため、切り分け用にカスタムスキームを選んだ場合も
+        # 動作自体は変わらない。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.qsprobe
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        # entitlements ファイルは意図的に持たない (SideStore が再署名する)
+
+  # ====================================================================
+  # Share Extension
+  #
+  # 共有シート (写真アプリ / ファイル App / Safari など) から
+  # ファイルを受け取り、共有コンテナへ置いてホストアプリを起こす。
+  # 転送そのものは行わない。拡張はメモリ上限が厳しく、長時間の
+  # ネットワーク処理に耐えないため (AlterSend / LocalSend も同じ判断)。
+  #
+  # sources に Sources/Shared を含めているのは、グループ ID の解決と
+  # マニフェストの型をホストと共有するため。フレームワークを切らずに
+  # 同じファイルを両方のターゲットへコンパイルする。
+  # ====================================================================
+  QSProbeShare:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.6"
+    sources:
+      - path: ShareExtension
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.qsprobe.share
+        PRODUCT_NAME: QSProbeShare
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        SKIP_INSTALL: "YES"
+    # ホストと同じ文字列であること。ここがずれると別コンテナになる。
+    entitlements:
+      path: ShareExtension/QSProbeShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.anony.qsprobe
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: QSProbe
+        <<: *versionDefaults
+        NSExtension:
+          # ストーリーボードを使わず、クラスを直接指定する。
+          # XcodeGen だけで完結させるため。
+          NSExtensionPrincipalClass: ShareViewController
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionAttributes:
+            # 共有シートに出る条件。ここに無い種類では拡張が現れない。
+            # フォルダを受ける指定は存在しない (iOS の共有シート自体が
+            # フォルダを添付物として扱わない)。
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 100
+              NSExtensionActivationSupportsMovieWithMaxCount: 100
+              NSExtensionActivationSupportsFileWithMaxCount: 100
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 100
+            # 写真アプリの共有シートに出すために要る。
+            PHSupportedMediaTypes:
+              - Image
+              - Video

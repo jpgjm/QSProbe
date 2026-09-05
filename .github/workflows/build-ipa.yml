@@ -1,0 +1,496 @@
+# 汎用 iOS IPA ビルドワークフロー (単体で完結)
+# rev: 9 (generic / project 非依存)
+#
+# rev9 の変更点:
+#   - ad-hoc 署名をバンドル単位にした。<プロダクト名>.entitlements を
+#     .app と各 .appex に対応付けて、内側 (.appex) から順に署名する。
+#     App Extension を持つプロジェクトでも entitlements が両方に載る。
+#     rev8 は entitlements が 2 個あると素通りしていた。
+#
+# rev8 の変更点:
+#   - IPA 化の直前に「entitlements があれば ad-hoc 署名する」ステップを足した。
+#     CODE_SIGNING_ALLOWED=NO のままだと entitlements のブロブが成果物に
+#     入らず、SideStore / AltStore が再署名するときに App Groups や
+#     keychain-access-groups を要求していないものと判断してしまうため。
+#     ad-hoc 署名 (--sign -) は証明書を必要としないので、ランナーに
+#     秘密情報を置かずに要求内容だけを埋め込める。
+#   - *.entitlements が 0 個なら丸ごと素通りする。entitlements を持たない
+#     プロジェクトの挙動は rev7 と完全に同じ。
+#
+# rev7 の変更点:
+#   - 3 つの成果物すべてにリポジトリ名を入れ、命名を統一した。
+#         <stamp>_<repo>_<種別>
+#     リポジトリ名は ${GITHUB_REPOSITORY##*/} をそのまま使う。
+#     ケバブ化も末尾サフィックス除去も一切しない。
+#     jpgjm/vivi_music_ios -> vivi_music_ios
+#   - リポジトリ名は checkout 前から参照できるため、
+#     STAMP と一緒に最初のステップで全パスを確定するようにした。
+#     (以降のステップは変数を組み立て直さない)
+#   - 包みフォルダ名にもリポジトリ名が入ったので、
+#     複数リポジトリのスナップショットを並べても区別が付く。
+#
+# rev6 からの継続点:
+#   - ViviMusic のような固有名詞はワークフロー内に一切書かない。
+#   - .xcodeproj がコミット済みのリポジトリ / .xcworkspace のリポジトリ /
+#     project.yml だけのリポジトリ、いずれでもそのまま動く。
+#   - 成果物 (ZIP) の中身のフォルダ名・ファイル名にも同じ接頭辞を付ける。
+#
+# 名前解決は 2 系統に分かれている。混同しないこと。
+#   REPO_NAME    … 成果物の名前付けに使う   (リポジトリ名のみ)
+#   PROJECT_NAME … ビルド対象の特定に使う   (project.yml の name: が最優先)
+#   ※ xcodegen が吐くのは ViviMusic.xcodeproj であって
+#     vivi_music_ios.xcodeproj ではないため、両者は別物として扱う。
+#
+# 成果物は 3 つ。すべて JST のビルド時刻とリポジトリ名を頭に付ける。
+# 例 (jpgjm/vivi_music_ios の場合):
+#   2026-08-23T20-27-08+09-00_vivi_music_ios_Repository.zip
+#     └ 2026-08-23T20-27-08+09-00_vivi_music_ios_Repository/
+#   2026-08-23T20-27-08+09-00_vivi_music_ios_ipa.zip
+#     └ 2026-08-23T20-27-08+09-00_vivi_music_ios.ipa
+#   2026-08-23T20-27-08+09-00_vivi_music_ios_xcodebuild-log.zip
+#     └ 2026-08-23T20-27-08+09-00_vivi_music_ios_xcodebuild.log
+#
+# 時刻は最初のステップで 1 度だけ決め、3 つで同じ値を使う。
+# (ステップごとに date を呼ぶと数秒ずれて対応が取れなくなる)
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: 'ビルドするスキーム名 (空なら自動検出)'
+        required: false
+        default: ''
+      configuration:
+        description: 'ビルド構成 (Release / Debug)'
+        required: false
+        default: 'Release'
+      artifact_basename:
+        description: '成果物名に使う識別子 (空ならリポジトリ名をそのまま使用)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. 名前の確定
+      #    STAMP とリポジトリ名を 1 度だけ決め、
+      #    3 つの成果物の内外すべての名前をここで組み立てる。
+      #    GITHUB_REPOSITORY は checkout 前から使えるので
+      #    このステップで完結できる。
+      # ------------------------------------------------------------------
+      - name: Set build identifiers (JST)
+        run: |
+          set -euo pipefail
+
+          STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S+09-00')
+
+          # リポジトリ名をそのまま使う。大文字小文字もアンダースコアも
+          # 一切変換しない。jpgjm/vivi_music_ios -> vivi_music_ios
+          REPO_NAME="${{ github.event.inputs.artifact_basename }}"
+          [ -z "$REPO_NAME" ] && REPO_NAME="${GITHUB_REPOSITORY##*/}"
+
+          # 全成果物に共通する接頭辞。
+          PREFIX="${STAMP}_${REPO_NAME}"
+
+          # 成果物はすべて専用ディレクトリに置く。
+          # upload-artifact に単一ディレクトリを渡すと
+          # そのディレクトリが ZIP のルートになるため、
+          # 中のフォルダ名 / ファイル名をそのまま保持できる。
+          mkdir -p /tmp/out-repo /tmp/out-ipa /tmp/out-log
+
+          {
+            echo "STAMP=$STAMP"
+            echo "REPO_NAME=$REPO_NAME"
+            echo "PREFIX=$PREFIX"
+            echo "SNAPSHOT_DIR=/tmp/out-repo/${PREFIX}_Repository"
+            echo "IPA_PATH=/tmp/out-ipa/${PREFIX}.ipa"
+            echo "LOG_PATH=/tmp/out-log/${PREFIX}_xcodebuild.log"
+          } >> "$GITHUB_ENV"
+
+          echo "=== artifacts (outer / inner) ==="
+          echo "${PREFIX}_Repository        / ${PREFIX}_Repository/"
+          echo "${PREFIX}_ipa               / ${PREFIX}.ipa"
+          echo "${PREFIX}_xcodebuild-log    / ${PREFIX}_xcodebuild.log"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 2. ビルド対象の特定
+      #    成果物名 (REPO_NAME) とは別系統。
+      #    xcodegen が生成する .xcodeproj の名前は project.yml の
+      #    name: で決まるので、リポジトリ名では代用できない。
+      # ------------------------------------------------------------------
+      - name: Resolve project name
+        run: |
+          set -euo pipefail
+
+          # 優先順位: project.yml の name: -> 既存の *.xcodeproj -> リポジトリ名
+          if [ -f project.yml ]; then
+            PROJECT_YML="project.yml"
+          elif [ -f project.yaml ]; then
+            PROJECT_YML="project.yaml"
+          else
+            PROJECT_YML=""
+          fi
+
+          PROJECT_NAME=""
+          if [ -n "$PROJECT_YML" ]; then
+            # トップレベルの `name:` のみを拾う (インデント無しの行に限定)。
+            PROJECT_NAME=$(sed -nE 's/^name:[[:space:]]*"?([^"#]+)"?[[:space:]]*$/\1/p' "$PROJECT_YML" | head -1 | xargs || true)
+          fi
+
+          if [ -z "$PROJECT_NAME" ]; then
+            EXISTING_PROJ=$(ls -d *.xcodeproj 2>/dev/null | head -1 || true)
+            [ -n "$EXISTING_PROJ" ] && PROJECT_NAME="${EXISTING_PROJ%.xcodeproj}"
+          fi
+
+          [ -z "$PROJECT_NAME" ] && PROJECT_NAME="$REPO_NAME"
+
+          CONFIGURATION="${{ github.event.inputs.configuration }}"
+          [ -z "$CONFIGURATION" ] && CONFIGURATION="Release"
+
+          {
+            echo "PROJECT_YML=$PROJECT_YML"
+            echo "PROJECT_NAME=$PROJECT_NAME"
+            echo "CONFIGURATION=$CONFIGURATION"
+          } >> "$GITHUB_ENV"
+
+          echo "=== resolved ==="
+          echo "PROJECT_YML   : ${PROJECT_YML:-(none)}"
+          echo "PROJECT_NAME  : $PROJECT_NAME"
+          echo "CONFIGURATION : $CONFIGURATION"
+
+      # ------------------------------------------------------------------
+      # 3. リポジトリのスナップショット
+      #    xcodegen / xcodebuild を走らせる前に退避する。
+      #    後で取ると *.xcodeproj や build/ が混ざる。
+      #
+      #    <prefix>_Repository/ で包むのは、展開先を間違えたときの事故を
+      #    防ぐため。包まないと ZIP の中身が展開したフォルダに直接
+      #    ばら撒かれ、既存の作業ディレクトリに重ねてしまう危険がある。
+      # ------------------------------------------------------------------
+      - name: Snapshot repository
+        run: |
+          set -euo pipefail
+          mkdir -p "$SNAPSHOT_DIR"
+          rsync -a --exclude='.git' ./ "$SNAPSHOT_DIR"/
+          echo "=== snapshot ==="
+          find "$SNAPSHOT_DIR" -type f | wc -l
+          du -sh "$SNAPSHOT_DIR"
+          ls -a "$SNAPSHOT_DIR"
+
+      # ビルドが落ちても中身を確認できるよう always。
+      - name: Upload repository snapshot (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PREFIX }}_Repository
+          path: /tmp/out-repo
+          # .github/ や .gitignore を落とさないために必須。
+          # v4.4 以降は既定で隠しファイルが除外される。
+          include-hidden-files: true
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # 4. ツールチェイン
+      # ------------------------------------------------------------------
+      - name: Select newest Xcode available
+        run: |
+          echo "=== Available Xcodes ==="
+          ls -la /Applications | grep -i xcode || true
+          for X in $(ls /Applications | grep -E '^Xcode' | sort -V -r); do
+            APP="/Applications/$X/Contents/Developer"
+            if [ -d "$APP" ]; then
+              sudo xcode-select -s "$APP"
+              echo "Selected: $APP"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      # project.yml が無いリポジトリでは xcodegen を入れない。
+      - name: Install xcodegen
+        if: env.PROJECT_YML != ''
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        if: env.PROJECT_YML != ''
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          ls -la
+          test -d "${PROJECT_NAME}.xcodeproj" \
+            && echo "OK: ${PROJECT_NAME}.xcodeproj" \
+            || { echo "::error::${PROJECT_NAME}.xcodeproj が生成されていません"; exit 1; }
+
+      # ------------------------------------------------------------------
+      # 5. コンテナ (workspace / project) とスキームの決定
+      #    .xcworkspace があればそちらを優先する (CocoaPods / SPM 混在対策)。
+      # ------------------------------------------------------------------
+      - name: Resolve container and scheme
+        run: |
+          set -euo pipefail
+
+          WORKSPACE=$(ls -d *.xcworkspace 2>/dev/null | head -1 || true)
+          if [ -n "$WORKSPACE" ]; then
+            CONTAINER_FLAG="-workspace"
+            CONTAINER_PATH="$WORKSPACE"
+            SCHEMES_KEY=".workspace.schemes"
+          else
+            PROJ=$(ls -d "${PROJECT_NAME}.xcodeproj" 2>/dev/null || ls -d *.xcodeproj 2>/dev/null | head -1 || true)
+            if [ -z "$PROJ" ]; then
+              echo "::error::*.xcodeproj も *.xcworkspace も見つかりません"
+              exit 1
+            fi
+            CONTAINER_FLAG="-project"
+            CONTAINER_PATH="$PROJ"
+            SCHEMES_KEY=".project.schemes"
+          fi
+
+          # xcodebuild -list は先頭に警告を吐くことがあるので '{' 以降だけ拾う。
+          LIST_JSON=$(xcodebuild -list -json "$CONTAINER_FLAG" "$CONTAINER_PATH" 2>/dev/null | sed -n '/^{/,$p')
+          SCHEMES=$(printf '%s' "$LIST_JSON" | jq -r "(${SCHEMES_KEY} // [])[]" || true)
+
+          echo "=== available schemes ==="
+          printf '%s\n' "$SCHEMES"
+
+          SCHEME="${{ github.event.inputs.scheme }}"
+
+          # 指定が無ければ「プロジェクト名と一致するスキーム」を最優先、
+          # 無ければ先頭のスキーム。
+          if [ -z "$SCHEME" ]; then
+            if printf '%s\n' "$SCHEMES" | grep -qx -- "$PROJECT_NAME"; then
+              SCHEME="$PROJECT_NAME"
+            else
+              SCHEME=$(printf '%s\n' "$SCHEMES" | head -1)
+            fi
+          fi
+
+          if [ -z "$SCHEME" ]; then
+            echo "::error::スキームを解決できませんでした"
+            exit 1
+          fi
+
+          {
+            echo "CONTAINER_FLAG=$CONTAINER_FLAG"
+            echo "CONTAINER_PATH=$CONTAINER_PATH"
+            echo "SCHEME=$SCHEME"
+          } >> "$GITHUB_ENV"
+
+          echo "=== resolved ==="
+          echo "container : $CONTAINER_FLAG $CONTAINER_PATH"
+          echo "scheme    : $SCHEME"
+
+      # ------------------------------------------------------------------
+      # 6. ビルド
+      #    continue-on-error は使わない。失敗したらここで止める。
+      #    pipefail + tee でログは $LOG_PATH に常時保存。
+      # ------------------------------------------------------------------
+      - name: Build (no codesign)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            "$CONTAINER_FLAG" "$CONTAINER_PATH" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$LOG_PATH"
+
+      - name: Show build log tail
+        if: always()
+        run: |
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 "$LOG_PATH" || true
+
+      # 成功時のログも見たいので常時アップロード。エラー原因の追跡に必須。
+      - name: Upload xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PREFIX }}_xcodebuild-log
+          path: /tmp/out-log
+          if-no-files-found: warn
+
+      # ------------------------------------------------------------------
+      # 7. .app の検証
+      #    -derivedDataPath build を指定しているので出力先は固定。
+      #    ただしプロダクト名は不定なので、固定ディレクトリ直下の
+      #    *.app が「ちょうど 1 個」であることを確認して採用する。
+      #    (App Extension は .app の内側に入るのでここには現れない)
+      # ------------------------------------------------------------------
+      - name: Verify .app
+        run: |
+          set -euo pipefail
+          PRODUCTS_DIR="build/Build/Products/${CONFIGURATION}-iphoneos"
+          test -d "$PRODUCTS_DIR" || { echo "::error::$PRODUCTS_DIR がありません"; exit 1; }
+
+          COUNT=$(ls -d "$PRODUCTS_DIR"/*.app 2>/dev/null | wc -l | xargs)
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::$PRODUCTS_DIR 直下の .app が $COUNT 個です (1 個であるべき)"
+            ls -la "$PRODUCTS_DIR" || true
+            exit 1
+          fi
+
+          APP_PATH=$(ls -d "$PRODUCTS_DIR"/*.app)
+
+          # 実行バイナリ名は Info.plist の CFBundleExecutable から取る。
+          # PRODUCT_NAME と .app 名が食い違うプロジェクトでも壊れない。
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
+
+          test -f "$APP_PATH/$EXEC_NAME" || { echo "::error::実行バイナリ $EXEC_NAME がありません"; exit 1; }
+          test -f "$APP_PATH/Info.plist" || { echo "::error::Info.plist がありません"; exit 1; }
+
+          file "$APP_PATH/$EXEC_NAME"
+          ls -la "$APP_PATH"
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 8. entitlements の埋め込み (ある場合だけ)
+      #
+      #    ビルドは CODE_SIGNING_ALLOWED=NO なので、成果物には署名も
+      #    entitlements のブロブも入っていない。ところが SideStore / AltStore /
+      #    Impactor は再署名するとき「このアプリが何を要求しているか」を
+      #    バイナリの署名から読み、それに合わせて App ID に capability を付ける。
+      #    署名が無いと何も要求していないと見なされ、App Groups や
+      #    keychain-access-groups がプロビジョニングプロファイルに入らない。
+      #    (QSProbe で実測済み。署名を足したとたんに App Group が下りた)
+      #
+      #    そこで ad-hoc 署名 (--sign -) で entitlements だけ埋め込む。
+      #    証明書は要らないのでランナーに秘密情報を置かなくてよい。
+      #    署名そのものは再署名で捨てられるが、要求内容は読み取られる。
+      #
+      #    ## 対応付けの規約
+      #
+      #    バンドルごとに <プロダクト名>.entitlements を探して使う。
+      #
+      #        Foo.app                    -> Foo.entitlements
+      #        Foo.app/PlugIns/Bar.appex  -> Bar.entitlements
+      #
+      #    置き場所は問わない (作業ツリー全体から名前で引く)。XcodeGen の
+      #    entitlements.path をこの名前にしておけば自動で噛み合う。
+      #    見つからないバンドルは署名しない。entitlements を 1 つも持たない
+      #    プロジェクトではこのステップは何もしない。
+      #
+      #    ## 署名の順番
+      #
+      #    入れ子のバンドルは内側から署名する。先に .app を署名すると、
+      #    あとから .appex を署名した時点で外側の署名が壊れる。
+      #
+      #    ## 注意
+      #
+      #    SideStore は App Groups / keychain-access-groups が 3 個を超えると
+      #    再署名に失敗する報告がある。数を増やしすぎないこと。
+      # ------------------------------------------------------------------
+      - name: Embed entitlements (ad-hoc sign, if any)
+        run: |
+          set -euo pipefail
+
+          # <プロダクト名>.entitlements を作業ツリーから引く。
+          # 同名が複数あったら曖昧なので署名しない。
+          find_entitlements() {
+            local name="$1"
+            local hits
+            hits=$(find . \
+              -name "${name}.entitlements" \
+              -not -path './build/*' \
+              -not -path './.git/*' \
+              -not -path '*/DerivedData/*' \
+              | sort)
+            local count
+            count=$(printf '%s' "$hits" | grep -c . || true)
+            if [ "$count" = "1" ]; then
+              printf '%s' "$hits"
+            elif [ "$count" != "0" ]; then
+              echo "::warning::${name}.entitlements が $count 個あります。曖昧なので署名しません" >&2
+            fi
+          }
+
+          # 内側から順に署名する。
+          sign_bundle() {
+            local bundle="$1"
+            local name
+            name=$(basename "$bundle")
+            name="${name%.*}"
+
+            local ent
+            ent=$(find_entitlements "$name")
+
+            if [ -z "$ent" ]; then
+              echo "  $name … entitlements なし。素通り"
+              return 0
+            fi
+
+            echo "  $name … $ent"
+            plutil -p "$ent"
+            codesign --force --sign - --entitlements "$ent" --timestamp=none "$bundle"
+          }
+
+          SIGNED=0
+
+          # 1) App Extension (.appex) を先に
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            for APPEX in "$APP_PATH"/PlugIns/*.appex; do
+              [ -d "$APPEX" ] || continue
+              sign_bundle "$APPEX"
+              SIGNED=1
+            done
+          fi
+
+          # 2) 本体 (.app) を後に
+          sign_bundle "$APP_PATH"
+          SIGNED=1
+
+          if [ "$SIGNED" = "0" ]; then
+            echo "署名対象がありませんでした。"
+            exit 0
+          fi
+
+          echo "=== 埋め込み結果 ==="
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            for APPEX in "$APP_PATH"/PlugIns/*.appex; do
+              [ -d "$APPEX" ] || continue
+              echo "--- $(basename "$APPEX")"
+              codesign -d --entitlements :- "$APPEX" 2>/dev/null || echo "  (署名なし)"
+            done
+          fi
+          echo "--- $(basename "$APP_PATH")"
+          codesign -d --entitlements :- "$APP_PATH" 2>/dev/null || echo "  (署名なし)"
+
+      # ------------------------------------------------------------------
+      # 9. IPA 化
+      #    ZIP のルートが Payload/ になるよう、作業ディレクトリを切って
+      #    その中で zip する。
+      # ------------------------------------------------------------------
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/Payload"
+          cp -R "$APP_PATH" "$STAGE/Payload/"
+          ( cd "$STAGE" && zip -qry "$IPA_PATH" Payload )
+          rm -rf "$STAGE"
+
+          echo "=== IPA info ==="
+          ls -lh "$IPA_PATH"
+          unzip -l "$IPA_PATH" | tail -3
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PREFIX }}_ipa
+          path: /tmp/out-ipa
+          if-no-files-found: error
